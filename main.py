@@ -13,6 +13,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
+# Task 1.2: Suppress httpx and httpcore INFO logs to prevent any URL / key leaks
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 logger = logging.getLogger("main")
 
 load_dotenv()
@@ -159,7 +163,8 @@ class ChatIn(BaseModel):
     message: str = Field(min_length=1, max_length=50000)
 
 
-@app.get("/")
+# Task 8: Support both GET and HEAD for clean Render health check
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {
         "status": "online",
@@ -182,11 +187,21 @@ def chat(body: ChatIn, request: Request):
         reply = ask(system, past + [{"role": "user", "content": body.message}])
     except Exception as e:
         logger.error(f"Error in /api/chat: {e}", exc_info=True)
-        raise HTTPException(502, f"The AI service did not respond: {str(e)}")
+        err_msg = str(e).lower()
+        if any(term in err_msg for term in ["timeout", "busy", "503", "429", "ai service", "unavailable", "temporarily"]):
+            raise HTTPException(
+                status_code=503,
+                detail="Abhi AI service busy hai. Kripya thodi der baad dobara koshish karein."
+            )
+        raise HTTPException(
+            status_code=500,
+            detail="Chat service me error aaya. Kripya dobara try karein."
+        )
     store.add_exchange(body.session_id, body.message, reply)
     return {"reply": reply}
 
 
+# Task 5: Stream error handling - prevents UI from freezing on "Reading resume knowledge..."
 @app.post("/api/chat/stream")
 def chat_stream(body: ChatIn, request: Request):
     limit(request)
@@ -198,17 +213,26 @@ def chat_stream(body: ChatIn, request: Request):
     )
     msgs = past + [{"role": "user", "content": body.message}]
 
-    def gen():
+    async def gen():
         parts = []
         try:
             for piece in ask_stream(system, msgs):
                 parts.append(piece)
                 yield piece
         except Exception as e:
-            logger.error(f"Error in /api/chat/stream: {e}", exc_info=True)
-            yield f"\n\n[The AI service stopped responding: {str(e)}. Send your message again.]"
-            return
-        store.add_exchange(body.session_id, body.message, "".join(parts))
+            logger.exception("Error during chat stream execution: %s", type(e).__name__)
+            # Task 5.1: Send friendly message on exception
+            if not parts:
+                yield "Abhi AI service busy hai, kripya thodi der baad dobara koshish karein."
+            else:
+                yield "\n\n[Abhi AI service busy hai, kripya thodi der baad dobara koshish karein.]"
+        finally:
+            # Task 5.2: Stream cleanly closes and captures generated parts
+            if parts:
+                try:
+                    store.add_exchange(body.session_id, body.message, "".join(parts))
+                except Exception as ex:
+                    logger.error(f"Failed to store stream exchange: {ex}")
 
     return StreamingResponse(
         gen(),
@@ -222,6 +246,7 @@ def history(session_id: str = Query(pattern=SID)):
     return {"messages": store.history(session_id, limit=50)}
 
 
+# Task 6: Error handling for /api/match - returns 503/500 JSON without raw traces
 @app.post("/api/match")
 def match(
     request: Request,
@@ -259,10 +284,20 @@ def match(
         r = matcher.run(resume_data, text)
     except ValueError as e:
         logger.warning(f"Validation error in matcher: {e}")
-        raise HTTPException(422, str(e))
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         logger.error(f"Matcher failed: {e}", exc_info=True)
-        raise HTTPException(502, f"The AI service did not respond: {str(e)}")
+        err_msg = str(e).lower()
+        # Task 6.1: Return 503 (upstream busy/timeout) or 500 (code bug), no 502
+        if any(term in err_msg for term in ["timeout", "busy", "503", "429", "ai service", "unavailable", "temporarily"]):
+            raise HTTPException(
+                status_code=503,
+                detail="Abhi AI service busy hai. Kripya thodi der baad dobara koshish karein."
+            )
+        raise HTTPException(
+            status_code=500,
+            detail="Job matching process me error aaya. Kripya dobara try karein."
+        )
 
     store.add_match(
         session_id,
@@ -343,4 +378,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
-

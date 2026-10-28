@@ -85,14 +85,19 @@ def close_client():
 atexit.register(close_client)
 
 
+_has_indexed_cache: Optional[bool] = None
+
+
 def init_collection(force_recreate: bool = False):
     """Ensures the resume_knowledge collection exists with proper vector params."""
+    global _has_indexed_cache
     client = get_qdrant_client()
     collections = [c.name for c in client.get_collections().collections]
 
     if COLLECTION_NAME in collections:
         if force_recreate:
             client.delete_collection(COLLECTION_NAME)
+            _has_indexed_cache = False
         else:
             return
 
@@ -103,18 +108,28 @@ def init_collection(force_recreate: bool = False):
             distance=Distance.COSINE,
         ),
     )
+    _has_indexed_cache = False
     print(f"[Qdrant] Created collection '{COLLECTION_NAME}'.")
 
 
 def has_indexed_data() -> bool:
-    """Checks whether the vector database already contains indexed resume data."""
+    """Checks whether the vector database already contains indexed resume data (cached in memory)."""
+    if os.getenv("TESTING"):
+        return False
+
+    global _has_indexed_cache
+    if _has_indexed_cache is not None:
+        return _has_indexed_cache
+
     try:
         client = get_qdrant_client()
         collections = [c.name for c in client.get_collections().collections]
         if COLLECTION_NAME not in collections:
+            _has_indexed_cache = False
             return False
         info = client.get_collection(COLLECTION_NAME)
-        return (info.points_count or 0) > 0
+        _has_indexed_cache = (info.points_count or 0) > 0
+        return _has_indexed_cache
     except Exception:
         return False
 
@@ -264,6 +279,8 @@ def ingest_resume_text(raw_text: str) -> int:
         )
 
     client.upsert(collection_name=COLLECTION_NAME, points=points)
+    global _has_indexed_cache
+    _has_indexed_cache = True
     print(f"[RAG] Successfully stored {len(points)} knowledge points in Qdrant vector database.")
     return len(points)
 

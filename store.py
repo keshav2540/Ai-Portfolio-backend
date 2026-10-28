@@ -21,7 +21,10 @@ mongo_uri = os.getenv("MONGO_URI")
 db_name = os.getenv("DB_NAME") or "ai_portfolio"
 is_cloud = bool(os.getenv("VERCEL") or os.getenv("RENDER"))
 
-if is_cloud and not mongo_uri:
+if os.getenv("TESTING"):
+    # Fast in-memory mode for testing without external network dependencies
+    pass
+elif is_cloud and not mongo_uri:
     print(
         "[Store WARNING] Running on cloud (Vercel/Render) but MONGO_URI is not set. "
         "Persistent database storage will not work; falling back to ephemeral in-memory store."
@@ -31,7 +34,8 @@ else:
     try:
         _client = MongoClient(
             uri,
-            serverSelectionTimeoutMS=4000,
+            connectTimeoutMS=2000,
+            serverSelectionTimeoutMS=2000,
         )
         _db = _client[db_name]
         messages = _db["messages"]
@@ -41,12 +45,15 @@ else:
 
 
 def init():
+    global messages, matches
     try:
         if messages is not None and matches is not None:
             messages.create_index([("sid", ASCENDING), ("ts", ASCENDING)])
             matches.create_index([("sid", ASCENDING), ("ts", DESCENDING)])
     except Exception as e:
         print(f"[Store notice] Could not create Mongo indexes ({e}), proceeding with memory fallback.")
+        messages = None
+        matches = None
 
 
 def add_exchange(sid, user_text, bot_text):

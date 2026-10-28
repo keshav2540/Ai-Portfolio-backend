@@ -1,5 +1,8 @@
 """JD -> requirements -> evidence check against resume -> score computed by formula (not by the LLM)."""
+import logging
 from llm import ask_json
+
+logger = logging.getLogger("matcher")
 
 MAX_JD_CHARS = 50000
 LEVEL = {"yes": 1.0, "partial": 0.5, "no": 0.0}
@@ -54,8 +57,11 @@ def run(resume: str, jd_text: str) -> dict:
     nice_r = cmp.get("nice_to_have", []) if isinstance(cmp.get("nice_to_have"), list) else []
     exp = cmp.get("experience", "na")
 
-    parts = [(WEIGHTS["must"], _avg(must_r)), (WEIGHTS["nice"], _avg(nice_r)),
-             (WEIGHTS["exp"], None if exp == "na" else LEVEL.get(exp, 0.0))]
+    parts = [
+        (WEIGHTS["must"], _avg(must_r)),
+        (WEIGHTS["nice"], _avg(nice_r)),
+        (WEIGHTS["exp"], None if exp == "na" else LEVEL.get(exp, 0.0)),
+    ]
     parts = [(w, v) for w, v in parts if v is not None]
     score = round(100 * sum(w * v for w, v in parts) / sum(w for w, _ in parts)) if parts else 0
     verdict = "fit" if score >= 70 else "partial" if score >= 50 else "not_fit"
@@ -75,5 +81,11 @@ def run(resume: str, jd_text: str) -> dict:
         if isinstance(i, dict) and "item" in i and i.get("level") == "no":
             missing.append(i["item"])
 
-    return {"title": req.get("title") or "Job description", "score": score, "verdict": verdict,
-            "matched": matched, "missing": missing, "reason": cmp.get("reason", "")}
+    return {
+        "title": req.get("title") or "Job description",
+        "score": score,
+        "verdict": verdict,
+        "matched": matched,
+        "missing": missing,
+        "reason": cmp.get("reason", ""),
+    }

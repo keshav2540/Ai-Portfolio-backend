@@ -25,7 +25,7 @@ Independent backend service for the AI-powered portfolio chatbot and resume matc
    ```
    Fill in your `.env` variables:
    - `gemini_api_key`: Google AI Studio API key
-   - `MODEL`: Gemini model name (`gemini-3.5-flash`)
+   - `MODEL`: Gemini model name (`gemini-2.0-flash` or `gemini-1.5-flash`)
    - `EMBEDDING_MODEL`: Embedding model (`models/gemini-embedding-001`)
    - `EMBEDDING_DIM`: Embedding vector dimension (`768`)
    - `Qdrant_url`: Qdrant Cloud cluster endpoint

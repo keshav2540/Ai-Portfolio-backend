@@ -21,12 +21,23 @@ Return ONLY JSON:
 
 
 def _avg(items):
-    return sum(LEVEL.get(i.get("level"), 0.0) for i in items) / len(items) if items else None
+    if not items:
+        return None
+    scores = []
+    for i in items:
+        if isinstance(i, dict):
+            scores.append(LEVEL.get(i.get("level"), 0.0))
+        elif isinstance(i, str):
+            scores.append(0.5)
+    return sum(scores) / len(scores) if scores else None
 
 
 def run(resume: str, jd_text: str) -> dict:
     jd = jd_text[:MAX_JD_CHARS]
     req = ask_json(EXTRACT_SYS, f"<job_description>\n{jd}\n</job_description>")
+    if not isinstance(req, dict):
+        raise ValueError("Could not extract requirements from job description.")
+
     must, nice = req.get("must_have", []), req.get("nice_to_have", [])
     if not must and not nice:
         raise ValueError("Could not find any requirements in this job description.")
@@ -36,7 +47,11 @@ def run(resume: str, jd_text: str) -> dict:
         f"<resume>\n{resume}\n</resume>\n\nRequirements:\n{req}\n",
         max_tokens=2500,
     )
-    must_r, nice_r = cmp.get("must_have", []), cmp.get("nice_to_have", [])
+    if not isinstance(cmp, dict):
+        raise ValueError("Could not compare resume against requirements.")
+
+    must_r = cmp.get("must_have", []) if isinstance(cmp.get("must_have"), list) else []
+    nice_r = cmp.get("nice_to_have", []) if isinstance(cmp.get("nice_to_have"), list) else []
     exp = cmp.get("experience", "na")
 
     parts = [(WEIGHTS["must"], _avg(must_r)), (WEIGHTS["nice"], _avg(nice_r)),
@@ -46,8 +61,19 @@ def run(resume: str, jd_text: str) -> dict:
     verdict = "fit" if score >= 70 else "partial" if score >= 50 else "not_fit"
 
     allr = must_r + nice_r
-    matched = [i["item"] + (" (partly)" if i.get("level") == "partial" else "")
-               for i in allr if i.get("level") in ("yes", "partial")]
-    missing = [i["item"] for i in must_r if i.get("level") == "no"]
+    matched = []
+    for i in allr:
+        if isinstance(i, dict) and "item" in i:
+            lvl = i.get("level", "")
+            if lvl in ("yes", "partial"):
+                matched.append(i["item"] + (" (partly)" if lvl == "partial" else ""))
+        elif isinstance(i, str):
+            matched.append(i)
+
+    missing = []
+    for i in must_r:
+        if isinstance(i, dict) and "item" in i and i.get("level") == "no":
+            missing.append(i["item"])
+
     return {"title": req.get("title") or "Job description", "score": score, "verdict": verdict,
             "matched": matched, "missing": missing, "reason": cmp.get("reason", "")}

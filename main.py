@@ -1,4 +1,5 @@
 import collections
+import logging
 import os
 import secrets
 import time
@@ -7,6 +8,12 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, 
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from fastapi.responses import StreamingResponse
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("main")
 
 load_dotenv()
 import jd_parser
@@ -33,6 +40,7 @@ if not allow_origins:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
+    allow_origin_regex=r"^https://.*\.vercel\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -172,8 +180,9 @@ def chat(body: ChatIn, request: Request):
     )
     try:
         reply = ask(system, past + [{"role": "user", "content": body.message}])
-    except Exception:
-        raise HTTPException(502, "The AI service did not respond")
+    except Exception as e:
+        logger.error(f"Error in /api/chat: {e}", exc_info=True)
+        raise HTTPException(502, f"The AI service did not respond: {str(e)}")
     store.add_exchange(body.session_id, body.message, reply)
     return {"reply": reply}
 
@@ -195,8 +204,9 @@ def chat_stream(body: ChatIn, request: Request):
             for piece in ask_stream(system, msgs):
                 parts.append(piece)
                 yield piece
-        except Exception:
-            yield "\n\n[The AI service stopped responding. Send your message again.]"
+        except Exception as e:
+            logger.error(f"Error in /api/chat/stream: {e}", exc_info=True)
+            yield f"\n\n[The AI service stopped responding: {str(e)}. Send your message again.]"
             return
         store.add_exchange(body.session_id, body.message, "".join(parts))
 
@@ -228,7 +238,8 @@ def match(
             text = jd_parser.extract(file.filename, data)
         except ValueError as e:
             raise HTTPException(415, str(e))
-        except Exception:
+        except Exception as e:
+            logger.error(f"Could not read uploaded file {file.filename}: {e}", exc_info=True)
             raise HTTPException(
                 422, "Could not read this file. Try another copy or paste the text."
             )
@@ -247,9 +258,11 @@ def match(
     try:
         r = matcher.run(resume_data, text)
     except ValueError as e:
+        logger.warning(f"Validation error in matcher: {e}")
         raise HTTPException(422, str(e))
-    except Exception:
-        raise HTTPException(502, "The AI service did not respond")
+    except Exception as e:
+        logger.error(f"Matcher failed: {e}", exc_info=True)
+        raise HTTPException(502, f"The AI service did not respond: {str(e)}")
 
     store.add_match(
         session_id,

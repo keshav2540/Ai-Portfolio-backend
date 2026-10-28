@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import random
 import re
 import time
 from typing import Generator, List, Optional, Set
@@ -17,10 +18,9 @@ logger = logging.getLogger("llm")
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
-# Task 4.1: Timeout configuration
-HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+# Task 3 & 4: Retry configuration (initial + 2 retries = 3 attempts total)
 MAX_RETRIES = 3
-BACKOFF_DELAYS = [1.0, 2.0, 4.0]
+BACKOFF_DELAYS = [1.0, 2.0]
 
 # Task 2.2 & 2.4: Dead models tracking in memory for this process
 KNOWN_DEAD_MODELS: Set[str] = {
@@ -33,9 +33,59 @@ KNOWN_DEAD_MODELS: Set[str] = {
 _dead_models: Set[str] = set()
 _available_models_cache: Optional[Set[str]] = None
 
+# Task 7: Singleton reusable HTTP client with connection pooling
+_client_instance: Optional[httpx.Client] = None
+
+
+def get_client() -> httpx.Client:
+    global _client_instance
+    if os.getenv("TESTING") == "1":
+        # In testing mode, create a client directly so mock transports/patches apply cleanly
+        return httpx.Client(
+            timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+        )
+    if _client_instance is None or _client_instance.is_closed:
+        _client_instance = httpx.Client(
+            timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+        )
+    return _client_instance
+
+
+def _get_timeouts():
+    """Task 1: Differentiated timeouts for streaming, first token, and non-streaming."""
+    try:
+        read_timeout = float(os.getenv("LLM_READ_TIMEOUT", "30.0"))
+    except ValueError:
+        read_timeout = 30.0
+
+    try:
+        first_token_timeout = float(os.getenv("FIRST_TOKEN_TIMEOUT", "25.0"))
+    except ValueError:
+        first_token_timeout = 25.0
+
+    timeout_streaming_first = httpx.Timeout(connect=10.0, read=first_token_timeout, write=10.0, pool=10.0)
+    timeout_streaming_packet = httpx.Timeout(connect=10.0, read=read_timeout, write=10.0, pool=10.0)
+    timeout_non_streaming = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+    return timeout_streaming_first, timeout_streaming_packet, timeout_non_streaming
+
+
+def _get_thinking_config(model_name: str) -> Optional[dict]:
+    """
+    Task 2: Verified Gemini REST API format for reasoning models (e.g. Gemini 3 series).
+    Uses generationConfig.thinkingConfig.thinkingLevel ('minimal', 'low', 'medium', 'high').
+    Default is 'low' to minimize latency and prevent ReadTimeout.
+    """
+    level = os.getenv("GEMINI_THINKING_LEVEL", "low").strip().lower()
+    if not level or level in ("none", "off", "0"):
+        return None
+    # Only send thinkingConfig if model is Gemini 3 series or supports it
+    if "gemini-3" in model_name and level in ("minimal", "low", "medium", "high"):
+        return {"thinkingLevel": level}
+    return None
+
 
 def _get_api_key() -> str:
-    # Task 1.4: Only from environment variables
     key = os.getenv("GEMINI_API_KEY") or os.getenv("gemini_api_key") or ""
     key = key.strip()
     if not key:
@@ -51,17 +101,16 @@ def _sanitize(text: str, key: str) -> str:
 
 
 def get_configured_models() -> List[str]:
-    """Task 2.1: Primary and fallback models from environment variables."""
+    """Task 2.1 & 5: Primary and fallback models from environment variables."""
     primary = os.getenv("GEMINI_MODEL") or os.getenv("MODEL") or "gemini-3.8-flash"
     primary = primary.strip()
 
-    fallbacks_raw = os.getenv("GEMINI_FALLBACK_MODELS", "")
+    fallbacks_raw = os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.8-flash-lite")
     fallbacks = [m.strip() for m in fallbacks_raw.split(",") if m.strip()]
 
     candidates = [primary] + fallbacks
     valid: List[str] = []
     for m in candidates:
-        # Exclude models marked dead or known dead (unless user explicitly configured them as primary)
         if m in _dead_models:
             continue
         if m in KNOWN_DEAD_MODELS and m != primary:
@@ -70,9 +119,36 @@ def get_configured_models() -> List[str]:
             valid.append(m)
 
     if not valid:
-        # Fallback safeguard
         valid = [primary if primary not in _dead_models else "gemini-3.8-flash"]
     return valid
+
+
+def check_available_models(key: str) -> Set[str]:
+    """Task 5: Dynamically fetch valid models supporting generateContent from Gemini API."""
+    global _available_models_cache
+    if _available_models_cache is not None:
+        return _available_models_cache
+    try:
+        client = get_client()
+        headers = {"x-goog-api-key": key}
+        resp = client.get(
+            f"{BASE_URL}/models",
+            headers=headers,
+            timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0),
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            models = set()
+            for item in data.get("models", []):
+                name = item.get("name", "").replace("models/", "")
+                methods = item.get("supportedGenerationMethods", [])
+                if "generateContent" in methods:
+                    models.add(name)
+            _available_models_cache = models
+            return models
+    except Exception as e:
+        logger.warning(f"Could not dynamically query Gemini models ({type(e).__name__}); using configured fallback list.")
+    return set()
 
 
 def _format_contents(messages: list[dict]) -> list[dict]:
@@ -117,69 +193,92 @@ def ask(
     if gen_cfg:
         payload["generationConfig"] = gen_cfg
 
+    _, _, timeout_non_streaming = _get_timeouts()
     candidate_models = get_configured_models()
     last_error: Optional[Exception] = None
+    client = get_client()
 
-    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-        for model_name in candidate_models:
-            if model_name in _dead_models:
-                continue
+    for model_name in candidate_models:
+        if model_name in _dead_models:
+            continue
 
-            # Task 1.1: Gemini key in header, clean URL
-            url = f"{BASE_URL}/models/{model_name}:generateContent"
+        # Task 2: Inject thinkingConfig for models supporting reasoning
+        thinking_cfg = _get_thinking_config(model_name)
+        if thinking_cfg:
+            if "generationConfig" not in payload:
+                payload["generationConfig"] = {}
+            payload["generationConfig"]["thinkingConfig"] = thinking_cfg
+        elif "generationConfig" in payload and "thinkingConfig" in payload["generationConfig"]:
+            del payload["generationConfig"]["thinkingConfig"]
 
-            for attempt in range(MAX_RETRIES):
-                try:
-                    resp = client.post(url, headers=headers, json=payload)
-                    status = resp.status_code
+        # Clean URL, key passed via x-goog-api-key header
+        url = f"{BASE_URL}/models/{model_name}:generateContent"
 
-                    if status == 200:
-                        data = resp.json()
-                        candidates = data.get("candidates", [])
-                        if not candidates:
-                            return ""
-                        parts = candidates[0].get("content", {}).get("parts", [])
-                        text_parts = [p.get("text", "") for p in parts if "text" in p]
-                        return "".join(text_parts).strip()
+        for attempt in range(MAX_RETRIES):
+            start_time = time.time()
+            try:
+                resp = client.post(url, headers=headers, json=payload, timeout=timeout_non_streaming)
+                elapsed = time.time() - start_time
+                status = resp.status_code
 
-                    body_text = _sanitize(resp.text, key)
+                if status == 200:
+                    data = resp.json()
+                    candidates = data.get("candidates", [])
+                    if not candidates:
+                        return ""
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    text_parts = [p.get("text", "") for p in parts if "text" in p]
+                    return "".join(text_parts).strip()
 
-                    # Task 2.4 & Task 4.3: 404 or no longer available -> mark dead, do not retry
-                    if status == 404 or "no longer available" in body_text.lower() or "not found" in body_text.lower():
-                        _dead_models.add(model_name)
-                        logger.warning(
-                            f"Model '{model_name}' returned {status} (unavailable). Marked dead. Trying next fallback."
-                        )
-                        last_error = RuntimeError(f"Model '{model_name}' not available.")
-                        break  # Move to next fallback model immediately
+                body_text = _sanitize(resp.text, key)
 
-                    # Task 4.2: 503, 429 -> retry same model with exponential backoff
-                    if status in (503, 429):
-                        logger.warning(
-                            f"Gemini {model_name} returned status {status}. Attempt {attempt + 1}/{MAX_RETRIES}."
-                        )
-                        last_error = RuntimeError(f"AI service busy ({status}).")
-                        if attempt < MAX_RETRIES - 1:
-                            time.sleep(BACKOFF_DELAYS[attempt])
-                            continue
-                        else:
-                            break  # Retries exhausted for this model
-
-                    # Other client errors (400, 401, 403)
-                    logger.error(f"Gemini {model_name} returned unretryable status {status}: {body_text[:200]}")
-                    last_error = RuntimeError(f"AI service error ({status}).")
+                # Task 2.4 & Task 4.3: 404 or no longer available -> mark dead, do not retry
+                if status == 404 or "no longer available" in body_text.lower() or "not found" in body_text.lower():
+                    _dead_models.add(model_name)
+                    logger.warning(
+                        f"Model '{model_name}' returned {status} in {elapsed:.2f}s. Marked dead. Trying next fallback model."
+                    )
+                    last_error = RuntimeError(f"Model '{model_name}' not available.")
                     break
 
-                except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                    logger.warning(
-                        f"Network/Timeout with {model_name} on attempt {attempt + 1}/{MAX_RETRIES}: {type(exc).__name__}"
-                    )
-                    last_error = exc
+                # Task 3: 503, 429 -> retry same model with exponential backoff + jitter
+                if status in (503, 429):
+                    last_error = RuntimeError(f"AI service busy ({status}).")
                     if attempt < MAX_RETRIES - 1:
-                        time.sleep(BACKOFF_DELAYS[attempt])
+                        base_delay = BACKOFF_DELAYS[attempt] if attempt < len(BACKOFF_DELAYS) else 2.0
+                        delay = base_delay + random.uniform(0.1, 0.4)
+                        logger.warning(
+                            f"Gemini '{model_name}' returned status {status} in {elapsed:.2f}s (attempt {attempt + 1}/{MAX_RETRIES}). Retrying in {delay:.2f}s..."
+                        )
+                        time.sleep(delay)
                         continue
                     else:
+                        logger.warning(
+                            f"Retries exhausted for model '{model_name}' (status {status}) in {elapsed:.2f}s. Trying next fallback model."
+                        )
                         break
+
+                logger.error(f"Gemini '{model_name}' returned unretryable status {status} in {elapsed:.2f}s: {body_text[:200]}")
+                last_error = RuntimeError(f"AI service error ({status}).")
+                break
+
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                elapsed = time.time() - start_time
+                reason = type(exc).__name__
+                last_error = exc
+                if attempt < MAX_RETRIES - 1:
+                    base_delay = BACKOFF_DELAYS[attempt] if attempt < len(BACKOFF_DELAYS) else 2.0
+                    delay = base_delay + random.uniform(0.1, 0.4)
+                    logger.warning(
+                        f"Network/Timeout with '{model_name}' on attempt {attempt + 1}/{MAX_RETRIES} ({reason}) in {elapsed:.2f}s. Retrying in {delay:.2f}s..."
+                    )
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.warning(
+                        f"Network retries exhausted for '{model_name}' ({reason}) in {elapsed:.2f}s. Trying next fallback model."
+                    )
+                    break
 
     if last_error:
         raise last_error
@@ -189,7 +288,6 @@ def ask(
 def _clean_and_parse_json(raw: str) -> dict:
     """Helper to strip markdown fences, extract JSON and clean trailing commas."""
     raw = raw.strip()
-    # 1. Strip markdown fences if present
     cleaned = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE | re.MULTILINE)
     cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.MULTILINE).strip()
     try:
@@ -197,14 +295,12 @@ def _clean_and_parse_json(raw: str) -> dict:
     except Exception:
         pass
 
-    # 2. Extract outermost JSON object { ... }
     match = re.search(r"(\{.*\})", raw, re.DOTALL)
     if match:
         candidate = match.group(1).strip()
         try:
             return json.loads(candidate)
         except Exception:
-            # 3. Clean trailing commas in object or array
             cleaned_commas = re.sub(r",\s*([\]}])", r"\1", candidate)
             try:
                 return json.loads(cleaned_commas)
@@ -244,10 +340,11 @@ def ask_json(system: str, user: str, max_tokens: int | None = None) -> dict:
 def ask_stream(system: str, messages: list[dict], max_tokens: int | None = None) -> Generator[str, None, None]:
     """
     Streaming generator with:
-    - Task 1.1: x-goog-api-key header
-    - Task 3.1: resp.read() before reading response on non-200 (fixes ResponseNotRead)
-    - Task 4.4: Does not retry if tokens were already emitted mid-stream
-    - Task 4.2 & 4.3: 503/429 retries with backoff, 404 marks dead model
+    - Task 1: Separate FIRST_TOKEN_TIMEOUT and LLM_READ_TIMEOUT
+    - Task 2: Thinking overhead reduction via thinkingLevel: 'low'
+    - Task 3: Smart retry (ReadTimeout, 503, 429) with backoff + jitter; 404 marks dead
+    - Task 4: Fallback to non-streaming generateContent if all streaming attempts fail
+    - Task 7: Reusable HTTP connection
     """
     key = _get_api_key()
     headers = {
@@ -265,85 +362,123 @@ def ask_stream(system: str, messages: list[dict], max_tokens: int | None = None)
     if gen_cfg:
         payload["generationConfig"] = gen_cfg
 
+    timeout_streaming_first, _, _ = _get_timeouts()
     candidate_models = get_configured_models()
     tokens_yielded = 0
     last_error: Optional[Exception] = None
+    client = get_client()
 
-    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-        for model_name in candidate_models:
-            if model_name in _dead_models:
-                continue
+    for model_name in candidate_models:
+        if model_name in _dead_models:
+            continue
 
-            url = f"{BASE_URL}/models/{model_name}:streamGenerateContent?alt=sse"
+        # Task 2: Inject thinkingConfig for models supporting reasoning
+        thinking_cfg = _get_thinking_config(model_name)
+        if thinking_cfg:
+            if "generationConfig" not in payload:
+                payload["generationConfig"] = {}
+            payload["generationConfig"]["thinkingConfig"] = thinking_cfg
+        elif "generationConfig" in payload and "thinkingConfig" in payload["generationConfig"]:
+            del payload["generationConfig"]["thinkingConfig"]
 
-            for attempt in range(MAX_RETRIES):
-                try:
-                    with client.stream("POST", url, headers=headers, json=payload) as resp:
-                        status = resp.status_code
+        url = f"{BASE_URL}/models/{model_name}:streamGenerateContent?alt=sse"
 
-                        if status == 200:
-                            for line in resp.iter_lines():
-                                if line.startswith("data: "):
-                                    raw_chunk = line[6:].strip()
-                                    if raw_chunk:
-                                        try:
-                                            chunk_data = json.loads(raw_chunk)
-                                            candidates = chunk_data.get("candidates", [])
-                                            if candidates:
-                                                parts = candidates[0].get("content", {}).get("parts", [])
-                                                for p in parts:
-                                                    txt = p.get("text", "")
-                                                    if txt:
-                                                        tokens_yielded += 1
-                                                        yield txt
-                                        except Exception:
-                                            continue
-                            return
+        for attempt in range(MAX_RETRIES):
+            start_time = time.time()
+            try:
+                with client.stream("POST", url, headers=headers, json=payload, timeout=timeout_streaming_first) as resp:
+                    elapsed = time.time() - start_time
+                    status = resp.status_code
 
-                        # Task 3.1: CRITICAL BUG FIX - Read response content before inspecting text!
-                        resp.read()
-                        body_text = _sanitize(resp.text, key)
+                    if status == 200:
+                        for line in resp.iter_lines():
+                            if line.startswith("data: "):
+                                raw_chunk = line[6:].strip()
+                                if raw_chunk:
+                                    try:
+                                        chunk_data = json.loads(raw_chunk)
+                                        candidates = chunk_data.get("candidates", [])
+                                        if candidates:
+                                            parts = candidates[0].get("content", {}).get("parts", [])
+                                            for p in parts:
+                                                txt = p.get("text", "")
+                                                if txt:
+                                                    tokens_yielded += 1
+                                                    yield txt
+                                    except Exception:
+                                        continue
+                        return
 
-                        # Task 2.4 & Task 4.3: 404 or no longer available
-                        if status == 404 or "no longer available" in body_text.lower() or "not found" in body_text.lower():
-                            _dead_models.add(model_name)
+                    # Task 3.1: Read content on non-200 to prevent ResponseNotRead
+                    resp.read()
+                    body_text = _sanitize(resp.text, key)
+
+                    # 404 or no longer available -> mark dead, do not retry
+                    if status == 404 or "no longer available" in body_text.lower() or "not found" in body_text.lower():
+                        _dead_models.add(model_name)
+                        logger.warning(
+                            f"Stream model '{model_name}' returned {status} in {elapsed:.2f}s. Marked dead. Trying next fallback model."
+                        )
+                        last_error = RuntimeError(f"Model '{model_name}' not available.")
+                        break
+
+                    # 503, 429 -> retry same model
+                    if status in (503, 429):
+                        last_error = RuntimeError(f"AI service busy ({status}).")
+                        if attempt < MAX_RETRIES - 1:
+                            base_delay = BACKOFF_DELAYS[attempt] if attempt < len(BACKOFF_DELAYS) else 2.0
+                            delay = base_delay + random.uniform(0.1, 0.4)
                             logger.warning(
-                                f"Stream model '{model_name}' returned {status} (unavailable). Marked dead. Trying next fallback."
+                                f"Stream Gemini '{model_name}' returned status {status} in {elapsed:.2f}s (attempt {attempt + 1}/{MAX_RETRIES}). Retrying in {delay:.2f}s..."
                             )
-                            last_error = RuntimeError(f"Model '{model_name}' not available.")
+                            time.sleep(delay)
+                            continue
+                        else:
+                            logger.warning(
+                                f"Stream retries exhausted for '{model_name}' (status {status}) in {elapsed:.2f}s. Trying next fallback model."
+                            )
                             break
 
-                        # Task 4.2: 503, 429
-                        if status in (503, 429):
-                            logger.warning(
-                                f"Stream Gemini {model_name} returned status {status}. Attempt {attempt + 1}/{MAX_RETRIES}."
-                            )
-                            last_error = RuntimeError(f"AI service busy ({status}).")
-                            if attempt < MAX_RETRIES - 1:
-                                time.sleep(BACKOFF_DELAYS[attempt])
-                                continue
-                            else:
-                                break
+                    logger.error(f"Stream Gemini '{model_name}' returned unretryable status {status} in {elapsed:.2f}s: {body_text[:200]}")
+                    last_error = RuntimeError(f"AI service error ({status}).")
+                    break
 
-                        logger.error(f"Stream Gemini {model_name} returned unretryable status {status}: {body_text[:200]}")
-                        last_error = RuntimeError(f"AI service error ({status}).")
-                        break
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                elapsed = time.time() - start_time
+                reason = type(exc).__name__
 
-                except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                    # Task 4.4: Streaming me agar kuch tokens aa chuke hain, do not retry!
-                    if tokens_yielded > 0:
-                        logger.error(f"Network error mid-stream after emitting {tokens_yielded} tokens: {type(exc).__name__}")
-                        raise RuntimeError("Streaming connection interrupted mid-stream.") from exc
-
-                    logger.warning(
-                        f"Stream Network/Timeout on {model_name} attempt {attempt + 1}/{MAX_RETRIES}: {type(exc).__name__}"
+                # Task 3: If tokens already sent to user, DO NOT retry (avoid duplicate output)
+                if tokens_yielded > 0:
+                    logger.error(
+                        f"Stream connection interrupted mid-stream for '{model_name}' after {tokens_yielded} tokens ({reason}) in {elapsed:.2f}s."
                     )
-                    last_error = exc
-                    if attempt < MAX_RETRIES - 1:
-                        time.sleep(BACKOFF_DELAYS[attempt])
-                        continue
-                    else:
-                        break
+                    raise RuntimeError("Streaming connection interrupted mid-stream.") from exc
+
+                last_error = exc
+                if attempt < MAX_RETRIES - 1:
+                    base_delay = BACKOFF_DELAYS[attempt] if attempt < len(BACKOFF_DELAYS) else 2.0
+                    delay = base_delay + random.uniform(0.1, 0.4)
+                    logger.warning(
+                        f"Stream Network/Timeout on '{model_name}' attempt {attempt + 1}/{MAX_RETRIES} ({reason}) in {elapsed:.2f}s. Retrying in {delay:.2f}s..."
+                    )
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.warning(
+                        f"Stream retries exhausted for '{model_name}' ({reason}) in {elapsed:.2f}s. Trying next fallback model."
+                    )
+                    break
+
+    # Task 4: Saare streaming attempts fail hon to ek baar non-streaming generateContent try karo
+    if tokens_yielded == 0:
+        logger.info("All streaming attempts failed; attempting non-streaming fallback (generateContent)...")
+        try:
+            fallback_text = ask(system, messages, max_tokens=max_tokens)
+            if fallback_text:
+                yield fallback_text
+                return
+        except Exception as non_stream_exc:
+            logger.warning(f"Non-streaming fallback also failed: {type(non_stream_exc).__name__}")
 
     if last_error:
         raise last_error

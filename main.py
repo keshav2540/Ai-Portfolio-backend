@@ -213,7 +213,7 @@ def chat_stream(body: ChatIn, request: Request):
     )
     msgs = past + [{"role": "user", "content": body.message}]
 
-    async def gen():
+    def gen():
         parts = []
         try:
             for piece in ask_stream(system, msgs):

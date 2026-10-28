@@ -14,7 +14,7 @@ services:
       - key: PYTHON_VERSION
         value: 3.11.10
       - key: MODEL
-        value: gemini-2.0-flash
+        value: gemini-3.8-flash
       - key: EMBEDDING_MODEL
         value: models/gemini-embedding-001
       - key: EMBEDDING_DIM

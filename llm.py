@@ -12,12 +12,12 @@ logger = logging.getLogger("llm")
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
-DEFAULT_MODEL = "gemini-2.0-flash"
-FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash"]
+DEFAULT_MODEL = "gemini-3.8-flash"
+FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.5-flash", "gemini-2.0-flash"]
 
 raw_model = (os.getenv("MODEL") or "").strip()
-# Detect missing, empty, or invalid fake model names like 'gemini-3.5-flash'
-if not raw_model or "3.5" in raw_model or not ("gemini" in raw_model.lower() or "gemma" in raw_model.lower()):
+# Detect missing, empty, or older deprecated model names
+if not raw_model or raw_model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-3.5-flash"] or not ("gemini" in raw_model.lower() or "gemma" in raw_model.lower()):
     MODEL = DEFAULT_MODEL
 else:
     MODEL = raw_model

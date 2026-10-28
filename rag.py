@@ -6,7 +6,7 @@ from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
-import embedding
+import embeddings as embedding
 
 load_dotenv()
 
@@ -144,16 +144,34 @@ def chunk_resume(text: str) -> List[Dict[str, Any]]:
     current_section = "OVERVIEW"
     section_map: Dict[str, List[str]] = {}
 
+    KNOWN_SECTIONS = [
+        "SUMMARY",
+        "FEATURED PROJECTS",
+        "PROJECTS",
+        "TECHNICAL SKILLS",
+        "EDUCATION",
+        "MORE PROJECTS",
+        "TRAINING",
+        "EXPERIENCE",
+        "INTERESTS",
+    ]
+
     for line in lines:
-        upper = line.upper()
-        # Detect section headings
-        if any(upper.startswith(s) for s in ["SUMMARY:", "EDUCATION:", "TECHNICAL SKILLS:", "PROJECTS:", "INTERESTS:", "EXPERIENCE:"]):
-            current_section = upper.split(":")[0].strip()
+        upper = line.upper().strip()
+        matched_sec = None
+        for s in KNOWN_SECTIONS:
+            if upper == s or upper.startswith(s + ":") or upper.startswith(s + " ("):
+                matched_sec = "PROJECTS" if "PROJECTS" in s and "MORE" not in s else s
+                break
+
+        if matched_sec:
+            current_section = matched_sec
             if current_section not in section_map:
                 section_map[current_section] = []
-            content_after = line.split(":", 1)[1].strip()
-            if content_after:
-                section_map[current_section].append(content_after)
+            if ":" in line and line.split(":", 1)[0].upper().strip() in KNOWN_SECTIONS:
+                after = line.split(":", 1)[1].strip()
+                if after:
+                    section_map[current_section].append(after)
         else:
             if current_section not in section_map:
                 section_map[current_section] = []
@@ -215,7 +233,7 @@ def chunk_resume(text: str) -> List[Dict[str, Any]]:
         current_proj_lines = []
 
         for p_line in section_map["PROJECTS"]:
-            if not p_line.startswith("-") and not p_line.startswith("•"):
+            if not p_line.startswith("-") and not p_line.startswith("•") and not p_line.startswith("Live:") and not p_line.startswith("Technologies:"):
                 if current_proj_title and current_proj_lines:
                     chunks.append({
                         "id": order_idx,

@@ -33,13 +33,12 @@ SID = r"^[A-Za-z0-9-]{8,64}$"
 app = FastAPI(title="AI Portfolio API with Memory & Adaptive RAG")
 
 raw_origins = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
-allow_origins = [
+default_origins = ["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"]
+allow_origins = list(set([
     origin.strip().rstrip("/")
     for origin in raw_origins.split(",")
     if origin.strip()
-]
-if not allow_origins:
-    allow_origins = ["http://localhost:5173"]
+] + default_origins))
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,7 +54,10 @@ _hits = collections.defaultdict(list)
 
 
 def limit(req: Request, n=100, per=60):
-    ip, now = req.client.host, time.time()
+    if req.method == "OPTIONS":
+        return
+    ip = req.client.host if req.client else "127.0.0.1"
+    now = time.time()
     _hits[ip] = [t for t in _hits[ip] if now - t < per]
     if len(_hits[ip]) >= n:
         raise HTTPException(429, "Too many requests. Wait a minute and try again.")
@@ -160,7 +162,7 @@ def matches_note(sid: str) -> str:
 
 class ChatIn(BaseModel):
     session_id: str = Field(pattern=SID)
-    message: str = Field(min_length=1, max_length=50000)
+    message: str | None = Field(default="", max_length=50000)
 
 
 # Task 8: Support both GET and HEAD for clean Render health check
@@ -177,14 +179,18 @@ def root():
 @app.post("/api/chat")
 def chat(body: ChatIn, request: Request):
     limit(request)
+    msg = (body.message or "").strip()
+    if not msg:
+        return {"reply": "Kripya apna sawal likhein."}
+
     past = store.history(body.session_id)
-    search_q = contextualize_query(body.message, past)
+    search_q = contextualize_query(msg, past)
     resume_data = get_resume_context(search_q)
     system = CHAT_SYS.format(
         resume=resume_data, matches=matches_note(body.session_id)
     )
     try:
-        reply = ask(system, past + [{"role": "user", "content": body.message}])
+        reply = ask(system, past + [{"role": "user", "content": msg}])
     except Exception as e:
         logger.error(f"Error in /api/chat: {e}", exc_info=True)
         err_msg = str(e).lower()
@@ -197,7 +203,7 @@ def chat(body: ChatIn, request: Request):
             status_code=500,
             detail="Chat service me error aaya. Kripya dobara try karein."
         )
-    store.add_exchange(body.session_id, body.message, reply)
+    store.add_exchange(body.session_id, msg, reply)
     return {"reply": reply}
 
 
@@ -205,13 +211,21 @@ def chat(body: ChatIn, request: Request):
 @app.post("/api/chat/stream")
 def chat_stream(body: ChatIn, request: Request):
     limit(request)
+    msg = (body.message or "").strip()
+    if not msg:
+        return StreamingResponse(
+            iter(["Kripya apna sawal likhein."]),
+            media_type="text/plain; charset=utf-8",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     past = store.history(body.session_id)
-    search_q = contextualize_query(body.message, past)
+    search_q = contextualize_query(msg, past)
     resume_data = get_resume_context(search_q)
     system = CHAT_SYS.format(
         resume=resume_data, matches=matches_note(body.session_id)
     )
-    msgs = past + [{"role": "user", "content": body.message}]
+    msgs = past + [{"role": "user", "content": msg}]
 
     def gen():
         parts = []
@@ -230,7 +244,7 @@ def chat_stream(body: ChatIn, request: Request):
             # Task 5.2: Stream cleanly closes and captures generated parts
             if parts:
                 try:
-                    store.add_exchange(body.session_id, body.message, "".join(parts))
+                    store.add_exchange(body.session_id, msg, "".join(parts))
                 except Exception as ex:
                     logger.error(f"Failed to store stream exchange: {ex}")
 
@@ -258,11 +272,12 @@ def match(
     if file and file.filename:
         data = file.file.read(MAX_FILE + 1)
         if len(data) > MAX_FILE:
-            raise HTTPException(413, "File is over 5 MB.")
+            raise HTTPException(413, "File is over 5 MB. Please upload a smaller file.")
         try:
             text = jd_parser.extract(file.filename, data)
         except ValueError as e:
-            raise HTTPException(415, str(e))
+            status = 415 if "unsupported file format" in str(e).lower() else 422
+            raise HTTPException(status, str(e))
         except Exception as e:
             logger.error(f"Could not read uploaded file {file.filename}: {e}", exc_info=True)
             raise HTTPException(
@@ -271,10 +286,10 @@ def match(
     else:
         text = jd_text.strip()
 
-    if len(text) < 100:
+    if len(text) < 50:
         raise HTTPException(
             422,
-            "Not enough text found. If the PDF is a scan, paste the job description text instead.",
+            "Not enough text found in job description (at least 50 characters required). If the file is a scan, paste the text directly.",
         )
 
     # Use complete resume knowledge from vector DB (or fallback)
@@ -307,10 +322,13 @@ def match(
         r["matched"],
         r["missing"],
     )
-    return {
+    response_data = {
         **{k: r[k] for k in ("score", "verdict", "matched", "missing", "reason")},
         "jd_preview": text[:1500],
     }
+    if r.get("note"):
+        response_data["note"] = r["note"]
+    return response_data
 
 
 @app.get("/api/rag/status")

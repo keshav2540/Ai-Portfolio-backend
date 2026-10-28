@@ -15,14 +15,12 @@ services:
         value: 3.11.10
       - key: GROQ_MODEL
         value: llama-3.3-70b-versatile
+      - key: GROQ_FALLBACK_MODEL
+        value: llama-3.1-8b-instant
+      - key: GROQ_VISION_MODEL
+        value: qwen/qwen3.8-27b
       - key: GROQ_API_KEY
         sync: false
-      - key: GEMINI_MODEL
-        value: gemini-3.8-flash
-      - key: GEMINI_FALLBACK_MODELS
-        value: ""
-      - key: MODEL
-        value: gemini-3.8-flash
       - key: EMBEDDING_MODEL
         value: models/gemini-embedding-001
       - key: EMBEDDING_DIM
@@ -41,4 +39,3 @@ services:
         sync: false
       - key: FRONTEND_ORIGIN
         sync: false
-

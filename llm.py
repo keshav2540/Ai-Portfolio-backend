@@ -4,7 +4,7 @@ import os
 import random
 import re
 import time
-from typing import Generator, List, Optional, Set
+from typing import Any, Generator, List, Optional, Set
 import httpx
 from dotenv import load_dotenv
 
@@ -13,8 +13,32 @@ load_dotenv()
 # Task 1.2: Suppress verbose HTTP request logs to prevent URL/header leaks
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+# Suppress LangChain / Groq SDK loggers to prevent key/URL leaks
+logging.getLogger("langchain").setLevel(logging.WARNING)
+logging.getLogger("langchain_groq").setLevel(logging.WARNING)
+logging.getLogger("groq").setLevel(logging.WARNING)
+logging.getLogger("langsmith").setLevel(logging.WARNING)
 
 logger = logging.getLogger("llm")
+
+# ---------------------------------------------------------------------------
+# Groq / LangChain imports — optional; Gemini path still works without them
+# ---------------------------------------------------------------------------
+try:
+    from langchain_groq import ChatGroq
+    from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
+    _LANGCHAIN_AVAILABLE = True
+except ImportError:
+    _LANGCHAIN_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Groq singleton and 10-min in-memory response cache
+# ---------------------------------------------------------------------------
+_groq_client: Optional[Any] = None
+_response_cache: dict = {}   # {cache_key: (response_text, timestamp)}
+_CACHE_TTL = 600             # 10 minutes
+
+MAX_TOTAL_CALLS = 4          # Budget per user request across Groq + Gemini
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -151,6 +175,97 @@ def check_available_models(key: str) -> Set[str]:
     return set()
 
 
+# ---------------------------------------------------------------------------
+# Groq helper functions
+# ---------------------------------------------------------------------------
+
+def _cache_key(system: str, messages: list) -> str:
+    import hashlib
+    raw = system + json.dumps(messages, sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _cache_get(key: str) -> Optional[str]:
+    entry = _response_cache.get(key)
+    if entry and (time.time() - entry[1]) < _CACHE_TTL:
+        return entry[0]
+    return None
+
+
+def _cache_set(key: str, value: str) -> None:
+    _response_cache[key] = (value, time.time())
+
+
+def _build_lc_messages(system: str, messages: list) -> list:
+    """Convert dicts to LangChain message objects."""
+    lc = []
+    if system:
+        lc.append(SystemMessage(content=system))
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if role == "assistant":
+            lc.append(AIMessage(content=content))
+        else:
+            lc.append(HumanMessage(content=content))
+    if not lc or not any(isinstance(x, HumanMessage) for x in lc):
+        lc.append(HumanMessage(content="Hello"))
+    return lc
+
+
+def _get_groq_client() -> Any:
+    """Singleton ChatGroq instance. Never logs the API key."""
+    global _groq_client
+    if _groq_client is None:
+        model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+        try:
+            temperature = float(os.getenv("GROQ_TEMPERATURE", "0.7"))
+        except ValueError:
+            temperature = 0.7
+        try:
+            timeout = float(os.getenv("GROQ_TIMEOUT", "30.0"))
+        except ValueError:
+            timeout = 30.0
+        try:
+            max_retries = int(os.getenv("GROQ_MAX_RETRIES", "1"))
+        except ValueError:
+            max_retries = 1
+        api_key = os.getenv("GROQ_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError("GROQ_API_KEY is not set.")
+        _groq_client = ChatGroq(
+            model=model,
+            temperature=temperature,
+            timeout=timeout,
+            max_retries=max_retries,
+            api_key=api_key,
+        )
+    return _groq_client
+
+
+def _validate_groq_model() -> None:
+    """Called at startup: logs a warning if GROQ_API_KEY or GROQ_MODEL is missing. Never crashes."""
+    if not _LANGCHAIN_AVAILABLE:
+        logger.info("langchain-groq not installed; Groq provider disabled, Gemini will be used.")
+        return
+    if not os.getenv("GROQ_API_KEY", "").strip():
+        logger.info("GROQ_API_KEY not set; Groq provider disabled, Gemini will be used.")
+        return
+    model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+    try:
+        _get_groq_client()
+        logger.info(f"Groq provider enabled with model '{model}'.")
+    except Exception as e:
+        logger.warning(f"Groq provider init failed ({type(e).__name__}); Gemini fallback will be used.")
+
+
+# Run validation at module load
+try:
+    _validate_groq_model()
+except Exception:
+    pass
+
+
 def _format_contents(messages: list[dict]) -> list[dict]:
     contents = []
     for m in messages:
@@ -173,6 +288,49 @@ def ask(
     deterministic: bool = False,
     json_mode: bool = False,
 ) -> str:
+    # ------------------------------------------------------------------
+    # 1. Cache lookup (only for non-json_mode to keep it safe)
+    # ------------------------------------------------------------------
+    if not json_mode:
+        ck = _cache_key(system, messages)
+        cached = _cache_get(ck)
+        if cached is not None:
+            logger.info("ask(): Returning cached response.")
+            return cached
+
+    total_calls = 0
+    last_error: Optional[Exception] = None
+
+    # ------------------------------------------------------------------
+    # 2. Try Groq first (if configured and budget allows)
+    # ------------------------------------------------------------------
+    if _LANGCHAIN_AVAILABLE and os.getenv("GROQ_API_KEY", "").strip() and total_calls < MAX_TOTAL_CALLS:
+        try:
+            groq = _get_groq_client()
+            lc_messages = _build_lc_messages(system, messages)
+            start = time.time()
+            response = groq.invoke(lc_messages)
+            elapsed = time.time() - start
+            total_calls += 1
+            model_name = os.getenv("GROQ_MODEL", "groq")
+            text = (response.content or "").strip()
+            logger.info(f"Groq '{model_name}' success in {elapsed:.2f}s (call {total_calls}/{MAX_TOTAL_CALLS})")
+            if not json_mode:
+                _cache_set(ck, text)
+            return text
+        except Exception as groq_exc:
+            total_calls += 1
+            logger.warning(f"Groq ask() failed ({type(groq_exc).__name__}); falling back to Gemini.")
+            last_error = groq_exc
+
+    if total_calls >= MAX_TOTAL_CALLS:
+        if last_error:
+            raise last_error
+        raise RuntimeError("AI service temporarily unavailable. Please try again later.")
+
+    # ------------------------------------------------------------------
+    # 3. Gemini httpx path (unchanged)
+    # ------------------------------------------------------------------
     key = _get_api_key()
     headers = {
         "x-goog-api-key": key,
@@ -195,7 +353,6 @@ def ask(
 
     _, _, timeout_non_streaming = _get_timeouts()
     candidate_models = get_configured_models()
-    last_error: Optional[Exception] = None
     client = get_client()
 
     for model_name in candidate_models:
@@ -228,7 +385,10 @@ def ask(
                         return ""
                     parts = candidates[0].get("content", {}).get("parts", [])
                     text_parts = [p.get("text", "") for p in parts if "text" in p]
-                    return "".join(text_parts).strip()
+                    result_text = "".join(text_parts).strip()
+                    if not json_mode:
+                        _cache_set(_cache_key(system, messages), result_text)
+                    return result_text
 
                 body_text = _sanitize(resp.text, key)
 
@@ -340,12 +500,44 @@ def ask_json(system: str, user: str, max_tokens: int | None = None) -> dict:
 def ask_stream(system: str, messages: list[dict], max_tokens: int | None = None) -> Generator[str, None, None]:
     """
     Streaming generator with:
+    - Groq primary: streams tokens via ChatGroq.stream()
     - Task 1: Separate FIRST_TOKEN_TIMEOUT and LLM_READ_TIMEOUT
     - Task 2: Thinking overhead reduction via thinkingLevel: 'low'
     - Task 3: Smart retry (ReadTimeout, 503, 429) with backoff + jitter; 404 marks dead
     - Task 4: Fallback to non-streaming generateContent if all streaming attempts fail
     - Task 7: Reusable HTTP connection
     """
+    tokens_yielded = 0
+    total_calls = 0
+
+    # ------------------------------------------------------------------
+    # 1. Try Groq streaming first
+    # ------------------------------------------------------------------
+    if _LANGCHAIN_AVAILABLE and os.getenv("GROQ_API_KEY", "").strip() and total_calls < MAX_TOTAL_CALLS:
+        try:
+            groq = _get_groq_client()
+            lc_messages = _build_lc_messages(system, messages)
+            start = time.time()
+            for chunk in groq.stream(lc_messages):
+                txt = chunk.content if hasattr(chunk, "content") else ""
+                if txt:
+                    tokens_yielded += 1
+                    yield txt
+            total_calls += 1
+            model_name = os.getenv("GROQ_MODEL", "groq")
+            logger.info(f"Groq '{model_name}' stream complete, {tokens_yielded} tokens in {time.time()-start:.2f}s (call {total_calls}/{MAX_TOTAL_CALLS})")
+            return
+        except Exception as groq_exc:
+            total_calls += 1
+            if tokens_yielded > 0:
+                # Mid-stream error — do NOT switch providers (would duplicate text)
+                logger.error(f"Groq mid-stream error after {tokens_yielded} tokens ({type(groq_exc).__name__}); cannot switch mid-stream.")
+                raise RuntimeError("Streaming connection interrupted mid-stream.") from groq_exc
+            logger.warning(f"Groq stream failed ({type(groq_exc).__name__}); falling back to Gemini.")
+
+    # ------------------------------------------------------------------
+    # 2. Gemini streaming path (unchanged)
+    # ------------------------------------------------------------------
     key = _get_api_key()
     headers = {
         "x-goog-api-key": key,
@@ -364,7 +556,6 @@ def ask_stream(system: str, messages: list[dict], max_tokens: int | None = None)
 
     timeout_streaming_first, _, _ = _get_timeouts()
     candidate_models = get_configured_models()
-    tokens_yielded = 0
     last_error: Optional[Exception] = None
     client = get_client()
 

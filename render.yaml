@@ -1,0 +1,36 @@
+services:
+  # ==========================================
+  # Backend Web Service (FastAPI) on Render
+  # ==========================================
+  - type: web
+    name: ai-portfolio-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.10
+      - key: MODEL
+        value: gemini-3.5-flash
+      - key: EMBEDDING_MODEL
+        value: models/gemini-embedding-001
+      - key: EMBEDDING_DIM
+        value: "768"
+      - key: DB_NAME
+        value: ai_portfolio
+      - key: gemini_api_key
+        sync: false
+      - key: Qdrant_url
+        sync: false
+      - key: Qdrant_api_key
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: INGEST_ADMIN_KEY
+        sync: false
+      - key: FRONTEND_ORIGIN
+        sync: false
+
